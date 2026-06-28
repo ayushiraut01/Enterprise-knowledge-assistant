@@ -46,7 +46,7 @@ A production-ready RAG (Retrieval-Augmented Generation) system that lets employe
 
 ### Prerequisites
 - Python 3.11+
-- GEMINI_API_KEY=your_key_here
+- Anthropic API key
 
 ### 1. Clone and install
 
