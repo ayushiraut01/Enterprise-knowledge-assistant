@@ -1,0 +1,162 @@
+"""
+Test suite for the Enterprise Knowledge Assistant.
+
+Run:
+    pytest tests/ -v
+"""
+
+import pytest
+import sys
+import os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+from fastapi.testclient import TestClient
+from unittest.mock import patch, MagicMock
+
+
+# ── Fixtures ─────────────────────────────────
+@pytest.fixture(scope="module")
+def client():
+    """TestClient with mocked pipeline and generator to avoid heavy deps."""
+    mock_pipeline = MagicMock()
+    mock_pipeline.collection_stats.return_value = {
+        "total_chunks": 42,
+        "embed_model": "all-MiniLM-L6-v2",
+        "chunk_size": 512,
+        "chunk_overlap": 64,
+    }
+    mock_pipeline.retrieve.return_value = [
+        {
+            "text": "Employees are eligible for 24 paid leaves annually.",
+            "source": "HR_Policy.txt",
+            "page": 1,
+            "score": 0.91,
+        }
+    ]
+
+    mock_generator = MagicMock()
+    mock_generator.generate.return_value = {
+        "answer": "Employees are eligible for 24 paid leaves annually. (Source: HR_Policy.txt, Page 1)",
+        "sources": [{"document": "HR_Policy.txt", "page": 1}],
+        "confidence": 0.91,
+    }
+
+    with patch("app.main._pipeline", mock_pipeline), \
+         patch("app.main._generator", mock_generator):
+        from app.main import app
+        with TestClient(app) as c:
+            yield c
+
+
+# ── Health & Stats ────────────────────────────
+class TestHealth:
+    def test_health_ok(self, client):
+        r = client.get("/health")
+        assert r.status_code == 200
+        assert r.json()["status"] == "ok"
+
+    def test_stats_returns_chunk_count(self, client):
+        r = client.get("/stats")
+        assert r.status_code == 200
+        data = r.json()
+        assert "total_chunks" in data
+        assert data["total_chunks"] == 42
+
+
+# ── /ask endpoint ─────────────────────────────
+class TestAsk:
+    def test_basic_question(self, client):
+        r = client.post("/ask", json={"question": "What is the employee leave policy?"})
+        assert r.status_code == 200
+        body = r.json()
+        assert "answer" in body
+        assert "sources" in body
+        assert "confidence" in body
+
+    def test_answer_contains_source(self, client):
+        r = client.post("/ask", json={"question": "What is the leave policy?"})
+        body = r.json()
+        assert len(body["sources"]) >= 1
+        assert body["sources"][0]["document"] == "HR_Policy.txt"
+
+    def test_confidence_in_range(self, client):
+        r = client.post("/ask", json={"question": "leave policy"})
+        body = r.json()
+        assert 0.0 <= body["confidence"] <= 1.0
+
+    def test_empty_question_returns_400(self, client):
+        r = client.post("/ask", json={"question": "  "})
+        assert r.status_code == 400
+
+    def test_missing_question_field_returns_422(self, client):
+        r = client.post("/ask", json={})
+        assert r.status_code == 422
+
+    def test_conversation_history_accepted(self, client):
+        history = [
+            {"role": "user", "content": "What is VPN?"},
+            {"role": "assistant", "content": "VPN stands for Virtual Private Network."},
+        ]
+        r = client.post("/ask", json={
+            "question": "How do I set it up?",
+            "conversation_history": history,
+        })
+        assert r.status_code == 200
+
+
+# ── Chunking unit tests ───────────────────────
+class TestChunking:
+    def test_chunk_text_basic(self):
+        from app.rag_pipeline import _chunk_text
+        text = "A" * 1000
+        chunks = _chunk_text(text, size=200, overlap=20)
+        assert len(chunks) > 1
+        # Each chunk should be ≤ size chars
+        for c in chunks:
+            assert len(c) <= 200
+
+    def test_chunk_drops_tiny_fragments(self):
+        from app.rag_pipeline import _chunk_text
+        text = "Hello world"  # Very short, single chunk
+        chunks = _chunk_text(text, size=200, overlap=20)
+        assert len(chunks) == 1
+
+    def test_chunk_overlap(self):
+        from app.rag_pipeline import _chunk_text
+        text = "x" * 300
+        chunks = _chunk_text(text, size=100, overlap=20)
+        # Overlap means chunks share some content
+        assert len(chunks) >= 3
+
+
+# ── Retrieval integration test ────────────────
+class TestRetrieval:
+    def test_retrieve_returns_scored_chunks(self):
+        """Integration: real pipeline with real embedder (uses in-memory ChromaDB)."""
+        import chromadb
+        from chromadb.config import Settings
+        from unittest.mock import patch
+        from sentence_transformers import SentenceTransformer
+
+        # Use in-memory ChromaDB for the test
+        mock_client = chromadb.EphemeralClient(settings=Settings(anonymized_telemetry=False))
+
+        with patch("app.rag_pipeline.chromadb.PersistentClient", return_value=mock_client):
+            from app.rag_pipeline import RAGPipeline
+            pipeline = RAGPipeline()
+
+            # Add a test document directly
+            embedder = SentenceTransformer("all-MiniLM-L6-v2")
+            text = "Employees are eligible for 24 paid leaves annually."
+            embedding = embedder.encode(text).tolist()
+            pipeline.collection.add(
+                ids=["test-001"],
+                embeddings=[embedding],
+                documents=[text],
+                metadatas=[{"source": "HR_Policy.txt", "page": 1, "chunk_index": 0}],
+            )
+
+            results = pipeline.retrieve("how many leaves do employees get?")
+            assert len(results) >= 1
+            assert results[0]["score"] > 0.5
+            assert "leaves" in results[0]["text"].lower()
